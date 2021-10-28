@@ -1,0 +1,197 @@
+* ocistow :TOC_3_gh:
+- [[#about][About]]
+- [[#how-it-works][How it works]]
+- [[#try-it-yourself][Try it yourself]]
+  - [[#prerequisites][Prerequisites]]
+  - [[#cli-cmdocistow][CLI (cmd/ocistow)]]
+  - [[#lambda-cmdocistow-lambda][Lambda (cmd/ocistow-lambda)]]
+    - [[#deploy][Deploy]]
+    - [[#invoke][Invoke]]
+  - [[#verify-signatures-with-cosign][Verify signatures with =cosign=]]
+  - [[#insight][Insight]]
+
+* About
+The =ocistow= codebase demonstrates a modern approach to a typical OCI image
+promotion workflow in AWS.
+
+It houses a Lambda (and bonus CLI) that can efficiently stream and mutate
+upstream container image layers into an ECR destination and subsequently sign
+them with KMS. It does so by utilising code from the excellent
+[[https://github.com/google/go-containerregistry][go-containerregistry]] and [[https://github.com/sigstore][sigstore]] projects.
+
+* How it works
+[[img/ocistow.png][img/ocistow.png]]
+Given an invoke payload of:
+1. A source image reference (any public container registry / private ECR)
+2. A destination image reference (private ECR)
+3. Some annotations to add
+
+It will:
+1. Stream only the missing image layers from source registry to destination ECR whilst handling ECR authentication
+2. Do so in memory, layer-by-layer[fn:1] (with Lambda's meagre 512mb filesystem remaining unused)
+3. Optionally mutate the image during this process to have user provided OCI
+   annotations and legacy Docker image labels (mimicking the sort of mandatory
+   tagging policy an organisation might have)
+4. And finally sign the image digests in AWS ECR using a KMS signing key for
+   later assertion of provenance at runtime (e.g. using a Kubernetes admission
+   controller like [[https://github.com/dlorenc/cosigned][cosigned]]).
+
+[fn:1]: Performance gains can be had by throwing more memory at the Lambda as
+this results in more allocated CPU and critically, network (at AWS' discretion).
+Empirically (though not very scientifically), I saw the following with the
+massive *3+ gigabyte* TensorFlow images from [[https://gcr.io][gcr.io]].
+
+- Test 1 (vanilla Lambda settings 128mb memory): 8.06 minutes
+- Test 2 (maxed out Lambda settings 10240mb memory): *1.35 minutes*
+
+No shared layers existed in my destination ECR between tests—all blobs were
+streamed from source to destination.
+
+#+begin_quote
+NOTE: This would be interesting to give a run through the [[https://github.com/alexcasalboni/aws-lambda-power-tuning][AWS Lambda Power Tuner]].
+#+end_quote
+* Try it yourself
+I can’t imagine anyone using the Lambda (nor CLI) verbatim in their workflow
+unless it happened to solve an exact gap (let me know if you do!), but the
+codebase may be a useful reference for informing your own build.
+
+For example, a Lambda /like/ =ocistow= could be that final "promotion" step in
+an organisation's container image supply chain which first involves the image
+running a gauntlet of vulnerability/malware/compliance scans in a Step Function
+state machine.
+
+However, outside of the Lambda space, CLIs like Google's [[https://https://github.com/google/go-containerregistry/blob/main/cmd/crane/doc/crane.md][crane]] and Sigstore's
+[[https://github.com/sigstore/cosign][cosign]] are much more polished and suitable to a range of container image
+copy/mutate/sign workflows. You should check them out.
+** Prerequisites
+An AWS account with a KMS signing key and ECR repository for playing with. The
+following =aws= incantations will do the trick presuming you have an
+appropriately privileged session.
+
+#+begin_src shell
+aws kms create-key \
+    --key-usage SIGN_VERIFY \
+    --customer-master-key-spec RSA_4096 \
+    --tags TagKey=Name,TagValue=ocistow \
+    --description "ocistow demo"
+
+aws ecr create-repository --repository-name ocistow-demo
+#+end_src
+** CLI (cmd/ocistow)
+As I was extracting the Lambda out from some larger research to post here, I
+realised it would be easy to add a CLI. The =ocistow= CLI can do the same thing
+as the Lambda but from your local machine. Though, unless it fits your exact use
+case, you may wish to just reference it for your own CLI implementation or otherwise
+reach for the much more practical Google [[https://github.com/google/go-containerregistry/blob/main/cmd/crane/doc/crane.md][crane]].
+
+In any case, you can get a build of =ocistow= from the [[https://github.com/martinbaillie/ocistow/releases][releases]] section or build and run
+yourself (the repository is a [[./flake.nix][Nix flake]] if that's your thing, otherwise you'll
+want a local Go 1.16+ toolchain):
+
+#+begin_src shell
+go <build|install|run> github.com/martinbaillie/ocistow/cmd/ocistow -h
+#+end_src
+
+#+begin_example
+Usage of ocistow:
+  -annotations value
+        destination image annotations (key=value)
+  -aws-kms-key-arn string
+        AWS KMS key ARN to use for signing
+  -aws-region string
+        AWS region to use for operations
+  -aws-xray
+        whether to enable AWS Xray tracing
+  -copy
+        whether to copy the image (default true)
+  -debug
+        debug logging
+  -destination string
+        destination image
+  -sign
+        whether to sign the image (default true)
+  -source string
+        source image
+#+end_example
+
+Kick the tyres by stowing DockerHub's =busybox:latest= into the demo ECR repository:
+#+begin_src shell
+ocistow \
+    -source=busybox \
+    -destination=111111111111.dkr.ecr.ap-southeast-2.amazonaws.com/ocistow-demo \
+    -aws-region=ap-southeast-2 \
+    -aws-kms-key-arn="<ARN from Prerequisites>" \
+    -annotations team=foo \
+    -annotations owner=martin
+#+end_src
+
+#+begin_example
+21:09:00.000  annotations={"owner":"martin","team":"foo"} component=service dst=111111111111.dkr.ecr.ap-southeast-2.amazonaws.com/ocistow-demo method=Copy src=busybox took=2.999482083s
+21:09:00.000  annotations={"owner":"martin","team":"foo"} component=service dst=111111111111.dkr.ecr.ap-southeast-2.amazonaws.com/ocistow-demo method=Sign took=878.351667ms
+#+end_example
+
+** Lambda (cmd/ocistow-lambda)
+*** Deploy
+For playing with the =ocistow-lambda= in your AWS account you can use the [[./env][CDK
+deployment]] in this repository. There's a [[./Makefile][Makefile]] target that can kick this
+process off (though like the CLI instructions above, either use the Nix flake or
+get yourself Go 1.16+ and additionally NodeJS for the CDK).
+
+#+begin_src shell
+make deploy AWS_KMS_KEY_ARN="<ARN from Prerequisites>"
+#+end_src
+
+This will build and deploy an aarch64/Graviton version of the Lambda to your
+account with necessary KMS/ECR permissions. Take note of the function ARN output
+for later invocation.
+*** Invoke
+Kick the tyres by stowing DockerHub's =busybox:latest= into the demo ECR repository:
+
+#+begin_quote
+NOTE: The Lambda expects a very simple [[https://github.com/martinbaillie/ocistow/blob/main/pkg/transport/lambda.go#L15-L19][JSON schema]] as its payload.
+#+end_quote
+
+#+begin_src shell
+aws lambda invoke \
+    --function-name "arn:aws:lambda:ap-southeast-2:111111111111:function:ocistow-function" --cli-binary-format raw-in-base64-out \
+    --payload '{
+        "SrcImageRef":"busybox",
+        "DstImageRef": "111111111111.dkr.ecr.ap-southeast-2.amazonaws.com/ocistow-demo",
+        "Annotations":{"team":"foo", "owner":"martin"}
+        }' /dev/stderr
+#+end_src
+
+#+begin_example
+{
+    "StatusCode": 200,
+    "ExecutedVersion": "$LATEST"
+}
+#+end_example
+
+** Verify signatures with =cosign=
+#+begin_src shell
+AWS_REGION=ap-southeast-2 cosign verify \
+    -key "<ARN from Prerequisites>" \
+    111111111111.dkr.ecr.ap-southeast-2.amazonaws.com/ocistow-demo
+#+end_src
+
+#+begin_example
+Verification for 111111111111.dkr.ecr.ap-southeast-2.amazonaws.com/ocistow-demo --
+The following checks were performed on each of these signatures:
+  - The cosign claims were validated
+  - The signatures were verified against the specified public key
+  - Any certificates were verified against the Fulcio roots.
+
+[{"critical":{"identity":{"docker-reference":"111111111111.dkr.ecr.ap-southeast-2.amazonaws.com/ocistow-demo"},"image":{"docker-manifest-digest":"sha256:ee16ac0396cdb32e870200cdcb30f9abcb6b95256e5b5cd57eb1fadf2d3b3c9d"},"type":"cosign container image signature"},"optional":{"team":"foo","owner":"martin"}}]
+#+end_example
+
+** Insight
+A [[https://stripe.com/blog/canonical-log-lines][canonical log line]] is output for each service method (Copy, Sign) which you'll find on the terminal output for CLI and in CloudWatch for Lambda.
+
+If debug logging is enabled (flag: =-debug=, env: =DEBUG=) then much more
+detailed output is made available from the backend libraries used.
+
+If AWS Xray is enabled (flag: =-aws-xray=, env: =AWS_XRAY=) then detailed traces
+of the layer-by-layer =ocistow= operations are also propagated:
+
+[[img/segments.png][img/segments.png]]

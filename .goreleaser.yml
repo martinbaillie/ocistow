@@ -1,0 +1,17 @@
+archives:
+  - id: ocistow
+    format: binary
+builds:
+  - id: ocistow
+    env:
+      - CGO_ENABLED=0
+    main: ./cmd/ocistow/main.go
+    binary: ocistow
+    flags:
+      - -trimpath
+    goarch:
+      - amd64
+      - arm64
+    goos:
+      - linux
+      - darwin
